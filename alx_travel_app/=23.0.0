@@ -1,0 +1,16 @@
+Collecting django-filter
+  Downloading django_filter-25.1-py3-none-any.whl.metadata (5.1 kB)
+Collecting Django>=4.2 (from django-filter)
+  Downloading django-5.2.4-py3-none-any.whl.metadata (4.1 kB)
+Collecting asgiref>=3.8.1 (from Django>=4.2->django-filter)
+  Downloading asgiref-3.9.1-py3-none-any.whl.metadata (9.3 kB)
+Collecting sqlparse>=0.3.1 (from Django>=4.2->django-filter)
+  Downloading sqlparse-0.5.3-py3-none-any.whl.metadata (3.9 kB)
+Downloading django_filter-25.1-py3-none-any.whl (94 kB)
+Downloading django-5.2.4-py3-none-any.whl (8.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.3/8.3 MB 20.9 MB/s eta 0:00:00
+Downloading asgiref-3.9.1-py3-none-any.whl (23 kB)
+Downloading sqlparse-0.5.3-py3-none-any.whl (44 kB)
+Installing collected packages: sqlparse, asgiref, Django, django-filter
+
+Successfully installed Django-5.2.4 asgiref-3.9.1 django-filter-25.1 sqlparse-0.5.3
