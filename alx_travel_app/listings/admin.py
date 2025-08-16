@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Listing, Booking, Review
+from .models import Listing, Booking, Review, Payment
 
 # Register your models here.
 
@@ -105,3 +105,73 @@ class ReviewAdmin(admin.ModelAdmin):
         return bool(obj.cleanliness_rating or obj.accuracy_rating or obj.location_rating or obj.value_rating)
     has_detailed_ratings.boolean = True
     has_detailed_ratings.short_description = 'Has Detailed Ratings'
+
+
+@admin.register(Payment)
+class PaymentAdmin(admin.ModelAdmin):
+    """
+    Admin configuration for Payment model
+    """
+    list_display = (
+        'payment_id', 'user', 'booking', 'amount', 'currency', 
+        'payment_method', 'status', 'chapa_tx_ref', 'created_at'
+    )
+    list_filter = (
+        'status', 'payment_method', 'currency', 'created_at', 'paid_at'
+    )
+    search_fields = (
+        'payment_id', 'chapa_tx_ref', 'chapa_transaction_id', 
+        'user__username', 'user__email', 'booking__id'
+    )
+    list_editable = ('status',)
+    ordering = ('-created_at',)
+    readonly_fields = (
+        'payment_id', 'created_at', 'updated_at', 'paid_at', 
+        'is_successful', 'is_pending', 'can_be_refunded'
+    )
+    
+    fieldsets = (
+        ('Payment Information', {
+            'fields': (
+                'payment_id', 'booking', 'user', 'amount', 'currency', 
+                'payment_method', 'status'
+            )
+        }),
+        ('Chapa Details', {
+            'fields': (
+                'chapa_tx_ref', 'chapa_checkout_url', 'chapa_transaction_id',
+                'payment_reference'
+            )
+        }),
+        ('Status Information', {
+            'fields': (
+                'is_successful', 'is_pending', 'can_be_refunded',
+                'failure_reason'
+            )
+        }),
+        ('Gateway Response', {
+            'fields': ('gateway_response',),
+            'classes': ('collapse',)
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at', 'paid_at'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('booking', 'user', 'booking__listing')
+    
+    def has_change_permission(self, request, obj=None):
+        """Allow status changes but protect critical fields"""
+        return True
+    
+    def get_readonly_fields(self, request, obj=None):
+        """Make certain fields readonly after creation"""
+        readonly = list(self.readonly_fields)
+        if obj:  # Editing existing payment
+            readonly.extend([
+                'booking', 'user', 'amount', 'currency', 'payment_method',
+                'chapa_tx_ref', 'chapa_checkout_url', 'chapa_transaction_id'
+            ])
+        return readonly

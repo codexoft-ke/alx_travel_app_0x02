@@ -222,3 +222,18 @@ CELERY_ACCEPT_CONTENT = ['application/json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
+
+# Chapa Payment Gateway Configuration
+CHAPA_SECRET_KEY = env('CHAPA_SECRET_KEY', default='')
+CHAPA_PUBLIC_KEY = env('CHAPA_PUBLIC_KEY', default='')
+CHAPA_ENCRYPTION_KEY = env('CHAPA_ENCRYPTION_KEY', default='')
+CHAPA_BASE_URL = env('CHAPA_BASE_URL', default='https://api.chapa.co/v1')
+
+# Email Configuration
+EMAIL_BACKEND = env('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = env('EMAIL_HOST', default='smtp.gmail.com')
+EMAIL_PORT = env('EMAIL_PORT', default=587)
+EMAIL_USE_TLS = env('EMAIL_USE_TLS', default=True)
+EMAIL_HOST_USER = env('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default='')
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='ALX Travel App <noreply@alxtravel.com>')

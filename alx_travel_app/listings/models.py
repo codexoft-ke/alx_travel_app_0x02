@@ -2,6 +2,7 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal
+import uuid
 
 # Create your models here.
 
@@ -163,3 +164,141 @@ class Review(models.Model):
 
     def __str__(self):
         return f"Review by {self.user.username} for {self.listing.title} ({self.rating}/5)"
+
+
+class Payment(models.Model):
+    """
+    Payment model - represents payment transactions for bookings
+    """
+    PAYMENT_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('cancelled', 'Cancelled'),
+        ('refunded', 'Refunded'),
+    ]
+    
+    PAYMENT_METHOD_CHOICES = [
+        ('chapa', 'Chapa'),
+        ('bank_transfer', 'Bank Transfer'),
+        ('cash', 'Cash'),
+    ]
+    
+    # Core payment fields
+    payment_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+    booking = models.OneToOneField(
+        Booking, 
+        on_delete=models.CASCADE, 
+        related_name='payment',
+        help_text="Associated booking"
+    )
+    user = models.ForeignKey(
+        User, 
+        on_delete=models.CASCADE, 
+        related_name='payments',
+        help_text="User who made the payment"
+    )
+    
+    # Payment details
+    amount = models.DecimalField(
+        max_digits=10, 
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))],
+        help_text="Payment amount"
+    )
+    currency = models.CharField(max_length=3, default='ETB', help_text="Payment currency")
+    payment_method = models.CharField(
+        max_length=20, 
+        choices=PAYMENT_METHOD_CHOICES, 
+        default='chapa',
+        help_text="Payment method used"
+    )
+    status = models.CharField(
+        max_length=20, 
+        choices=PAYMENT_STATUS_CHOICES, 
+        default='pending',
+        help_text="Payment status"
+    )
+    
+    # Chapa-specific fields
+    chapa_tx_ref = models.CharField(
+        max_length=100, 
+        unique=True, 
+        null=True, 
+        blank=True,
+        help_text="Chapa transaction reference"
+    )
+    chapa_checkout_url = models.URLField(
+        null=True, 
+        blank=True,
+        help_text="Chapa checkout URL"
+    )
+    chapa_transaction_id = models.CharField(
+        max_length=100, 
+        null=True, 
+        blank=True,
+        help_text="Chapa transaction ID"
+    )
+    
+    # Additional tracking fields
+    payment_reference = models.CharField(
+        max_length=100, 
+        null=True, 
+        blank=True,
+        help_text="External payment reference"
+    )
+    gateway_response = models.JSONField(
+        null=True, 
+        blank=True,
+        help_text="Raw gateway response data"
+    )
+    failure_reason = models.TextField(
+        null=True, 
+        blank=True,
+        help_text="Reason for payment failure"
+    )
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    paid_at = models.DateTimeField(
+        null=True, 
+        blank=True,
+        help_text="Timestamp when payment was completed"
+    )
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "Payment"
+        verbose_name_plural = "Payments"
+        indexes = [
+            models.Index(fields=['chapa_tx_ref']),
+            models.Index(fields=['status']),
+            models.Index(fields=['created_at']),
+        ]
+    
+    def __str__(self):
+        return f"Payment {self.payment_id} - {self.status} - {self.amount} {self.currency}"
+    
+    @property
+    def is_successful(self):
+        """Check if payment was successful"""
+        return self.status == 'completed'
+    
+    @property
+    def is_pending(self):
+        """Check if payment is pending"""
+        return self.status in ['pending', 'processing']
+    
+    @property
+    def can_be_refunded(self):
+        """Check if payment can be refunded"""
+        return self.status == 'completed'
+    
+    def generate_tx_ref(self):
+        """Generate a unique transaction reference for Chapa"""
+        if not self.chapa_tx_ref:
+            self.chapa_tx_ref = f"ALX-{self.booking.id}-{uuid.uuid4().hex[:8].upper()}"
+            self.save(update_fields=['chapa_tx_ref'])
+        return self.chapa_tx_ref

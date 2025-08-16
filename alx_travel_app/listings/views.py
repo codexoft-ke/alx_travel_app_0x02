@@ -6,13 +6,22 @@ from django_filters.rest_framework import DjangoFilterBackend
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from django.db.models import Q
+from django.utils import timezone
+from django.shortcuts import get_object_or_404
+from django.urls import reverse
+import logging
 
-from .models import Listing, Booking, Review
+from .models import Listing, Booking, Review, Payment
 from .serializers import (
     ListingSerializer, ListingDetailSerializer, 
     BookingSerializer, BookingCreateSerializer,
-    ReviewSerializer, ReviewCreateSerializer
+    ReviewSerializer, ReviewCreateSerializer,
+    PaymentSerializer, PaymentCreateSerializer, PaymentStatusSerializer
 )
+from .services import ChapaPaymentService, ChapaPaymentError
+from .tasks import send_payment_confirmation_email, send_booking_confirmation_email, send_payment_failed_email
+
+logger = logging.getLogger(__name__)
 
 # Create your views here.
 
@@ -254,3 +263,294 @@ def welcome_view(request):
             "admin": "/admin/"
         }
     }, status=status.HTTP_200_OK)
+
+
+class PaymentViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing payments.
+    
+    Provides operations for payment initiation, verification, and status tracking.
+    """
+    serializer_class = PaymentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['status', 'payment_method', 'booking']
+    ordering_fields = ['created_at', 'amount', 'paid_at']
+    ordering = ['-created_at']
+    
+    def get_queryset(self):
+        """Return payments for the current user"""
+        return Payment.objects.filter(user=self.request.user).select_related(
+            'booking', 'booking__listing'
+        )
+    
+    def get_serializer_class(self):
+        """Return appropriate serializer based on action"""
+        if self.action == 'create':
+            return PaymentCreateSerializer
+        elif self.action in ['update_status', 'verify']:
+            return PaymentStatusSerializer
+        return PaymentSerializer
+    
+    def perform_create(self, serializer):
+        """Set the user field to the current user"""
+        serializer.save(user=self.request.user)
+    
+    @swagger_auto_schema(
+        method='post',
+        operation_description="Initiate payment for a booking",
+        request_body=PaymentCreateSerializer,
+        responses={
+            201: openapi.Response(
+                description="Payment initiated successfully",
+                schema=PaymentSerializer
+            ),
+            400: "Bad request - validation errors",
+            404: "Booking not found"
+        }
+    )
+    @action(detail=False, methods=['post'])
+    def initiate(self, request):
+        """
+        Initiate payment with Chapa
+        """
+        serializer = PaymentCreateSerializer(data=request.data, context={'request': request})
+        
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            # Create payment record
+            payment = serializer.save()
+            
+            # Initialize Chapa payment service
+            chapa_service = ChapaPaymentService()
+            
+            # Build callback and return URLs
+            callback_url = request.build_absolute_uri(
+                reverse('payment-webhook')
+            )
+            return_url = request.build_absolute_uri('/payment/success/')
+            
+            # Create payment payload
+            payment_payload = chapa_service.create_payment_payload(
+                payment=payment,
+                user=request.user,
+                booking=payment.booking,
+                callback_url=callback_url,
+                return_url=return_url
+            )
+            
+            # Initialize payment with Chapa
+            chapa_response = chapa_service.initialize_payment(payment_payload)
+            
+            # Update payment with Chapa response
+            payment.chapa_checkout_url = chapa_response.get('checkout_url')
+            payment.status = 'processing'
+            payment.gateway_response = chapa_response
+            payment.save()
+            
+            # Update booking status
+            payment.booking.status = 'pending'
+            payment.booking.save()
+            
+            # Send booking confirmation email
+            send_booking_confirmation_email.delay(payment.booking.id)
+            
+            # Return response with checkout URL
+            response_serializer = PaymentSerializer(payment)
+            return Response({
+                'message': 'Payment initiated successfully',
+                'payment': response_serializer.data,
+                'checkout_url': payment.chapa_checkout_url
+            }, status=status.HTTP_201_CREATED)
+            
+        except ChapaPaymentError as e:
+            logger.error(f"Chapa payment error: {str(e)}")
+            return Response({
+                'error': 'Payment initiation failed',
+                'details': str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        except Exception as e:
+            logger.error(f"Payment initiation error: {str(e)}")
+            return Response({
+                'error': 'Internal server error during payment initiation'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @swagger_auto_schema(
+        method='post',
+        operation_description="Verify payment status with Chapa",
+        responses={
+            200: openapi.Response(
+                description="Payment verification result",
+                schema=PaymentStatusSerializer
+            ),
+            404: "Payment not found",
+            400: "Verification failed"
+        }
+    )
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+        """
+        Verify payment status with Chapa
+        """
+        payment = self.get_object()
+        
+        if not payment.chapa_tx_ref:
+            return Response({
+                'error': 'No transaction reference available for verification'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            # Initialize Chapa service
+            chapa_service = ChapaPaymentService()
+            
+            # Verify payment with Chapa
+            verification_data = chapa_service.verify_payment(payment.chapa_tx_ref)
+            
+            # Update payment status
+            new_status = chapa_service.get_payment_status(verification_data)
+            old_status = payment.status
+            
+            payment.status = new_status
+            payment.chapa_transaction_id = verification_data.get('id')
+            payment.payment_reference = verification_data.get('reference')
+            payment.gateway_response = verification_data
+            
+            if new_status == 'completed' and old_status != 'completed':
+                payment.paid_at = timezone.now()
+                # Update booking status
+                payment.booking.status = 'confirmed'
+                payment.booking.save()
+                # Send confirmation email
+                send_payment_confirmation_email.delay(payment.id)
+            elif new_status == 'failed':
+                payment.failure_reason = verification_data.get('failure_reason', 'Payment failed')
+                # Send failure notification
+                send_payment_failed_email.delay(payment.id)
+            
+            payment.save()
+            
+            serializer = PaymentStatusSerializer(payment)
+            return Response({
+                'message': 'Payment verification completed',
+                'payment': serializer.data
+            })
+            
+        except ChapaPaymentError as e:
+            logger.error(f"Chapa verification error: {str(e)}")
+            return Response({
+                'error': 'Payment verification failed',
+                'details': str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        except Exception as e:
+            logger.error(f"Payment verification error: {str(e)}")
+            return Response({
+                'error': 'Internal server error during payment verification'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @swagger_auto_schema(
+        method='get',
+        operation_description="Get payment status",
+        responses={200: PaymentStatusSerializer}
+    )
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        """
+        Get current payment status
+        """
+        payment = self.get_object()
+        serializer = PaymentStatusSerializer(payment)
+        return Response(serializer.data)
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="Webhook endpoint for Chapa payment notifications",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={
+            'tx_ref': openapi.Schema(type=openapi.TYPE_STRING),
+            'status': openapi.Schema(type=openapi.TYPE_STRING),
+            'id': openapi.Schema(type=openapi.TYPE_STRING),
+            'amount': openapi.Schema(type=openapi.TYPE_NUMBER),
+            'currency': openapi.Schema(type=openapi.TYPE_STRING),
+        }
+    ),
+    responses={
+        200: "Webhook processed successfully",
+        400: "Invalid webhook data",
+        404: "Payment not found"
+    }
+)
+@api_view(['POST'])
+def payment_webhook(request):
+    """
+    Webhook endpoint for Chapa payment notifications
+    """
+    try:
+        webhook_data = request.data
+        tx_ref = webhook_data.get('tx_ref')
+        
+        if not tx_ref:
+            logger.warning("Webhook received without tx_ref")
+            return Response({'error': 'Missing tx_ref'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Find payment by transaction reference
+        try:
+            payment = Payment.objects.get(chapa_tx_ref=tx_ref)
+        except Payment.DoesNotExist:
+            logger.warning(f"Payment not found for tx_ref: {tx_ref}")
+            return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Initialize Chapa service for verification
+        chapa_service = ChapaPaymentService()
+        
+        # Verify payment with Chapa to ensure webhook authenticity
+        verification_data = chapa_service.verify_payment(tx_ref)
+        
+        # Update payment status
+        new_status = chapa_service.get_payment_status(verification_data)
+        old_status = payment.status
+        
+        payment.status = new_status
+        payment.chapa_transaction_id = verification_data.get('id')
+        payment.payment_reference = verification_data.get('reference')
+        payment.gateway_response = verification_data
+        
+        if new_status == 'completed' and old_status != 'completed':
+            payment.paid_at = timezone.now()
+            # Update booking status
+            payment.booking.status = 'confirmed'
+            payment.booking.save()
+            # Send confirmation email
+            send_payment_confirmation_email.delay(payment.id)
+        elif new_status == 'failed':
+            payment.failure_reason = verification_data.get('failure_reason', 'Payment failed')
+            # Send failure notification
+            send_payment_failed_email.delay(payment.id)
+        
+        payment.save()
+        
+        logger.info(f"Webhook processed successfully for payment {payment.id}")
+        
+        return Response({
+            'message': 'Webhook processed successfully',
+            'payment_id': payment.payment_id,
+            'status': payment.status
+        })
+        
+    except ChapaPaymentError as e:
+        logger.error(f"Chapa error in webhook: {str(e)}")
+        return Response({
+            'error': 'Payment verification failed',
+            'details': str(e)
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    except Exception as e:
+        logger.error(f"Webhook processing error: {str(e)}")
+        return Response({
+            'error': 'Internal server error'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

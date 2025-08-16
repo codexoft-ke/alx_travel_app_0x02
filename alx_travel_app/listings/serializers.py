@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Listing, Booking, Review
+from .models import Listing, Booking, Review, Payment
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -214,3 +214,94 @@ class ReviewCreateSerializer(serializers.ModelSerializer):
     def validate(self, data):
         """Validate review data"""
         return ReviewSerializer().validate(data)
+
+
+class PaymentSerializer(serializers.ModelSerializer):
+    """
+    Serializer for Payment model
+    """
+    booking = BookingSerializer(read_only=True)
+    user = UserSerializer(read_only=True)
+    booking_id = serializers.IntegerField(write_only=True)
+    
+    class Meta:
+        model = Payment
+        fields = [
+            'id', 'payment_id', 'booking', 'booking_id', 'user', 'amount', 'currency',
+            'payment_method', 'status', 'chapa_tx_ref', 'chapa_checkout_url',
+            'chapa_transaction_id', 'payment_reference', 'failure_reason',
+            'created_at', 'updated_at', 'paid_at', 'is_successful', 'is_pending'
+        ]
+        read_only_fields = [
+            'id', 'payment_id', 'user', 'chapa_tx_ref', 'chapa_checkout_url',
+            'chapa_transaction_id', 'payment_reference', 'failure_reason',
+            'created_at', 'updated_at', 'paid_at', 'is_successful', 'is_pending'
+        ]
+
+    def validate_booking_id(self, value):
+        """Validate booking exists and belongs to user"""
+        user = self.context['request'].user if self.context.get('request') else None
+        if user:
+            try:
+                booking = Booking.objects.get(id=value, user=user)
+                # Check if payment already exists for this booking
+                if hasattr(booking, 'payment'):
+                    raise serializers.ValidationError("Payment already exists for this booking")
+                return value
+            except Booking.DoesNotExist:
+                raise serializers.ValidationError("Booking not found or does not belong to you")
+        return value
+
+    def validate_amount(self, value):
+        """Validate payment amount matches booking total"""
+        booking_id = self.initial_data.get('booking_id')
+        if booking_id:
+            try:
+                booking = Booking.objects.get(id=booking_id)
+                if value != booking.total_price:
+                    raise serializers.ValidationError(
+                        f"Payment amount ({value}) must match booking total ({booking.total_price})"
+                    )
+            except Booking.DoesNotExist:
+                pass
+        return value
+
+    def create(self, validated_data):
+        """Create payment for booking"""
+        booking_id = validated_data.pop('booking_id')
+        booking = Booking.objects.get(id=booking_id)
+        
+        payment = Payment.objects.create(
+            booking=booking,
+            user=booking.user,
+            **validated_data
+        )
+        return payment
+
+
+class PaymentCreateSerializer(serializers.ModelSerializer):
+    """
+    Simplified serializer for creating payments
+    """
+    booking_id = serializers.IntegerField()
+    
+    class Meta:
+        model = Payment
+        fields = ['booking_id', 'amount', 'currency', 'payment_method']
+
+    def validate(self, data):
+        """Validate payment data"""
+        return PaymentSerializer(context=self.context).validate(data)
+
+
+class PaymentStatusSerializer(serializers.ModelSerializer):
+    """
+    Serializer for payment status updates
+    """
+    class Meta:
+        model = Payment
+        fields = [
+            'id', 'payment_id', 'status', 'chapa_transaction_id', 
+            'payment_reference', 'paid_at', 'is_successful'
+        ]
+        read_only_fields = ['id', 'payment_id', 'is_successful']
